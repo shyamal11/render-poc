@@ -167,7 +167,7 @@ def load_documents():
     try:
         # Get the data directory path
         data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-        excel_path = os.path.join(data_dir, "Data Sample for Altro AI.xlsx")
+        excel_path = os.path.join(data_dir, "Data Sample for Altro AI-1.xlsx")
         
         # Read Excel file
         xls = pd.ExcelFile(excel_path)
