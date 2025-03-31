@@ -3,10 +3,11 @@ Gunicorn
 flask-cors==4.0.0
 python-dotenv==1.0.1
 langchain==0.1.12
-langchain-community==0.0.27
+langchain-community>=0.0.28
 langchain-core==0.1.32
-psycopg2-binary==2.9.9
-torch==2.2.1
+asyncpg>=0.29.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
 transformers==4.38.2
 together==1.5.4
 pandas==2.2.1

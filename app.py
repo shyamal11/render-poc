@@ -10,9 +10,9 @@ from langchain_core.documents import Document
 import torch
 from transformers import AutoModel, AutoTokenizer
 from langchain_core.embeddings import Embeddings
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
 import hashlib
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -29,6 +29,20 @@ client.api_key = os.getenv('TOGETHER_API_KEY')
 
 # Configure CORS
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Create an event loop for async operations
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+async def get_db_pool():
+    """Get a connection pool for the database"""
+    if not hasattr(app, 'db_pool'):
+        app.db_pool = await asyncpg.create_pool(os.getenv('DATABASE_URL'))
+    return app.db_pool
+
+def run_async(coro):
+    """Helper function to run async code in sync context"""
+    return asyncio.get_event_loop().run_until_complete(coro)
 
 def get_file_hash(file_path):
     """Calculate MD5 hash of a file"""
@@ -106,85 +120,66 @@ def load_documents():
         print(f"Error loading data: {str(e)}")
         raise
 
-def collection_exists(connection_string: str, collection_name: str) -> bool:
+async def collection_exists(connection_string: str, collection_name: str) -> bool:
     """Check if the collection exists in the database"""
     try:
-        conn = psycopg2.connect(connection_string)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Check if the collection exists
-        cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = %s
-            );
-        """, (collection_name,))
-        
-        exists = cur.fetchone()['exists']
-        cur.close()
-        conn.close()
-        return exists
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = $1
+                );
+            """, collection_name)
+            return exists
     except Exception as e:
-        print(f"Error checking collection existence: {str(e)}")
+        logger.error(f"Error checking collection existence: {str(e)}")
         return False
 
-def get_stored_hash(connection_string: str, collection_name: str) -> str:
+async def get_stored_hash(connection_string: str, collection_name: str) -> str:
     """Get the stored hash of the Excel file from the database"""
     try:
-        conn = psycopg2.connect(connection_string)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Check if hash table exists
-        cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'file_hashes'
-            );
-        """)
-        
-        if not cur.fetchone()['exists']:
-            # Create hash table if it doesn't exist
-            cur.execute("""
-                CREATE TABLE file_hashes (
-                    collection_name TEXT PRIMARY KEY,
-                    file_hash TEXT NOT NULL
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Check if hash table exists
+            table_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'file_hashes'
                 );
             """)
-            conn.commit()
-            return None
-        
-        # Get stored hash
-        cur.execute("""
-            SELECT file_hash FROM file_hashes WHERE collection_name = %s;
-        """, (collection_name,))
-        
-        result = cur.fetchone()
-        cur.close()
-        conn.close()
-        return result['file_hash'] if result else None
+            
+            if not table_exists:
+                # Create hash table if it doesn't exist
+                await conn.execute("""
+                    CREATE TABLE file_hashes (
+                        collection_name TEXT PRIMARY KEY,
+                        file_hash TEXT NOT NULL
+                    );
+                """)
+                return None
+            
+            # Get stored hash
+            return await conn.fetchval("""
+                SELECT file_hash FROM file_hashes WHERE collection_name = $1;
+            """, collection_name)
     except Exception as e:
-        print(f"Error getting stored hash: {str(e)}")
+        logger.error(f"Error getting stored hash: {str(e)}")
         return None
 
-def update_stored_hash(connection_string: str, collection_name: str, file_hash: str):
+async def update_stored_hash(connection_string: str, collection_name: str, file_hash: str):
     """Update the stored hash of the Excel file in the database"""
     try:
-        conn = psycopg2.connect(connection_string)
-        cur = conn.cursor()
-        
-        # Update or insert hash
-        cur.execute("""
-            INSERT INTO file_hashes (collection_name, file_hash)
-            VALUES (%s, %s)
-            ON CONFLICT (collection_name) 
-            DO UPDATE SET file_hash = EXCLUDED.file_hash;
-        """, (collection_name, file_hash))
-        
-        conn.commit()
-        cur.close()
-        conn.close()
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO file_hashes (collection_name, file_hash)
+                VALUES ($1, $2)
+                ON CONFLICT (collection_name) 
+                DO UPDATE SET file_hash = EXCLUDED.file_hash;
+            """, collection_name, file_hash)
     except Exception as e:
-        print(f"Error updating stored hash: {str(e)}")
+        logger.error(f"Error updating stored hash: {str(e)}")
 
 # Initialize vector store
 def init_vectorstore():
@@ -205,11 +200,12 @@ def init_vectorstore():
     documents, current_hash = load_documents()
     
     # Check if collection exists and get stored hash
-    stored_hash = get_stored_hash(database_url, collection_name)
+    exists = run_async(collection_exists(database_url, collection_name))
+    stored_hash = run_async(get_stored_hash(database_url, collection_name))
     
     # If collection exists and hashes match, just return the existing vectorstore
-    if collection_exists(database_url, collection_name) and stored_hash == current_hash:
-        print(f"Collection {collection_name} exists and data is up to date")
+    if exists and stored_hash == current_hash:
+        logger.info(f"Collection {collection_name} exists and data is up to date")
         return PGVector(
             connection_string=database_url,
             embedding_function=embeddings,
@@ -217,7 +213,7 @@ def init_vectorstore():
         )
     
     # If collection exists but hashes don't match, or collection doesn't exist
-    print(f"Updating collection {collection_name} with new data...")
+    logger.info(f"Updating collection {collection_name} with new data...")
     vectorstore = PGVector.from_documents(
         documents=documents,
         embedding=embeddings,
@@ -227,9 +223,9 @@ def init_vectorstore():
     )
     
     # Update stored hash
-    update_stored_hash(database_url, collection_name, current_hash)
+    run_async(update_stored_hash(database_url, collection_name, current_hash))
     
-    print("Vector store initialization complete!")
+    logger.info("Vector store initialization complete!")
     return vectorstore
 
 # Initialize vector store during app startup
@@ -316,8 +312,58 @@ User Query: {user_input}
         print(f"Error processing request: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route('/test-db')
+def test_db():
+    """Test database connection and collection status"""
+    try:
+        collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
+        database_url = os.getenv('DATABASE_URL')
+        
+        # Test database connection and collection existence
+        exists = run_async(collection_exists(database_url, collection_name))
+        
+        # Get current and stored hashes
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        excel_path = os.path.join(data_dir, "Data Sample for Altro AI.xlsx")
+        current_hash = get_file_hash(excel_path)
+        stored_hash = run_async(get_stored_hash(database_url, collection_name))
+        
+        # Get collection size if it exists
+        collection_size = None
+        if exists:
+            pool = run_async(get_db_pool())
+            async def get_collection_size():
+                async with pool.acquire() as conn:
+                    return await conn.fetchval(f"""
+                        SELECT COUNT(*) FROM {collection_name};
+                    """)
+            collection_size = run_async(get_collection_size())
+        
+        return jsonify({
+            "database_connection": "success",
+            "collection_exists": exists,
+            "collection_name": collection_name,
+            "collection_size": collection_size,
+            "hash_table": {
+                "current_file_hash": current_hash,
+                "stored_hash": stored_hash,
+                "needs_update": current_hash != stored_hash if stored_hash else True
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error testing database: {str(e)}")
+        return jsonify({
+            "error": "Database test failed",
+            "details": str(e)
+        }), 500
+
+@app.teardown_appcontext
+async def close_db_pool(error):
+    """Close the database pool when the application shuts down"""
+    if hasattr(app, 'db_pool'):
+        await app.db_pool.close()
+
 if __name__ == '__main__':
     # Get port dynamically from Render's environment or default to 8000
-    port = int(os.getenv("PORT", 8000))
-    logger.info(f"Application will run on port: {port}")
+    port = int(os.getenv('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
