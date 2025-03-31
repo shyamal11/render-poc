@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from together import Together
-from app.config import MODEL_NAME, TOGETHER_API_KEY
-from app.vector_store import init_vectorstore
+from config import MODEL_NAME, TOGETHER_API_KEY
+from vector_store import init_vectorstore
 import os
 import traceback
 

@@ -1,7 +1,7 @@
 from flask import Flask
 from flask_cors import CORS
-from app.routes import routes
-from app.vector_store import init_vectorstore
+from routes import routes
+from vector_store import init_vectorstore
 import os
 import logging
 
