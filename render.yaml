@@ -14,8 +14,10 @@ services:
       - key: MODEL_NAME
         value: togethercomputer/llama-2-70b-chat
       - key: COLLECTION_NAME
-        value: art_of_living_projects
+        sync: false
       - key: PORT
         value: 8000
+      - key: FLASK_ENV
+        value: production
     healthCheckPath: /
     autoDeploy: true 
