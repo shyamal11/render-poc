@@ -34,6 +34,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
+# Global embeddings instance
+embeddings = None
+query_vectorstore = None
+
 async def get_db_pool():
     """Get a connection pool for the database"""
     if not hasattr(app, 'db_pool'):
@@ -55,22 +59,106 @@ def get_file_hash(file_path):
 class NomicEmbeddings(Embeddings):
     def __init__(self):
         self.model_name = "nomic-ai/nomic-embed-text-v1.5"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(self.model_name, trust_remote_code=True)
         self.max_length = 8192
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        try:
+            # Load model with memory optimizations
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, 
+                trust_remote_code=True
+            )
+            
+            self.model = AutoModel.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                device_map="auto",  # Automatically handle model placement
+                torch_dtype=torch.float16,  # Use half precision
+                low_cpu_mem_usage=True  # Optimize memory usage
+            )
+            
+            # Move model to appropriate device
+            self.model = self.model.to(self.device)
+            
+            # Enable evaluation mode
+            self.model.eval()
+            
+        except Exception as e:
+            logger.error(f"Error initializing model: {str(e)}")
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        texts = [str(t) for t in texts]
-        encoded_input = self.tokenizer(
-            texts, padding=True, truncation=True, max_length=self.max_length, return_tensors='pt'
-        )
-        with torch.no_grad():
-            outputs = self.model(**encoded_input)
-        embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-        return embeddings.tolist()
+        try:
+            texts = [str(t) for t in texts]
+            encoded_input = self.tokenizer(
+                texts, 
+                padding=True, 
+                truncation=True, 
+                max_length=self.max_length, 
+                return_tensors='pt'
+            )
+            
+            # Move inputs to the same device as the model
+            encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
+            
+            with torch.no_grad():
+                outputs = self.model(**encoded_input)
+            
+            # Get embeddings and move to CPU
+            embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+            
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            return embeddings.tolist()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logger.error("Out of memory error occurred. Clearing cache and retrying...")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
+            raise
 
     def embed_query(self, text: str) -> list[float]:
         return self.embed_documents([text])[0]
+        
+    def __del__(self):
+        """Cleanup when the object is destroyed"""
+        try:
+            if hasattr(self, 'model'):
+                del self.model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+
+def get_embeddings():
+    """Get or create the embeddings instance"""
+    global embeddings
+    if embeddings is None:
+        logger.info("Creating new embeddings instance...")
+        embeddings = NomicEmbeddings()
+    return embeddings
+
+def get_query_vectorstore():
+    """Get or create the query vector store with embeddings"""
+    global query_vectorstore, embeddings
+    if query_vectorstore is None:
+        logger.info("Creating query vector store...")
+        embeddings = get_embeddings()
+        collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
+        database_url = os.getenv('DATABASE_URL')
+        query_vectorstore = PGVector(
+            connection_string=database_url,
+            collection_name=collection_name,
+            embedding_function=embeddings
+        )
+    return query_vectorstore
 
 def load_documents():
     """
@@ -189,44 +277,80 @@ def init_vectorstore():
     # Create data directory if it doesn't exist
     os.makedirs(data_dir, exist_ok=True)
     
-    # Initialize embeddings
-    embeddings = NomicEmbeddings()
-    
     # Get collection name and database URL
     collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
     database_url = os.getenv('DATABASE_URL')
     
-    # Load documents and get current file hash
-    documents, current_hash = load_documents()
-    
-    # Check if collection exists and get stored hash
+    # First check if collection exists and get stored hash
     exists = run_async(collection_exists(database_url, collection_name))
     stored_hash = run_async(get_stored_hash(database_url, collection_name))
     
-    # If collection exists and hashes match, just return the existing vectorstore
-    if exists and stored_hash == current_hash:
-        logger.info(f"Collection {collection_name} exists and data is up to date")
-        return PGVector(
+    # If collection exists, check if we need to update
+    if exists:
+        # Get current file hash without loading the data
+        excel_path = os.path.join(data_dir, "Data Sample for Altro AI.xlsx")
+        current_hash = get_file_hash(excel_path)
+        
+        # If hashes match, just return the query vector store
+        if stored_hash == current_hash:
+            logger.info(f"Collection {collection_name} exists and data is up to date")
+            return get_query_vectorstore()
+    
+    # Only create embeddings if we need to update the collection
+    logger.info(f"Loading documents and updating collection {collection_name}...")
+    embeddings = get_embeddings()  # Create embeddings only when needed
+    documents, current_hash = load_documents()
+    
+    try:
+        # Create backup collection name
+        backup_collection = f"{collection_name}_backup"
+        
+        # If collection exists, create a backup
+        if exists:
+            logger.info(f"Creating backup of collection {collection_name}...")
+            backup_vectorstore = PGVector(
+                connection_string=database_url,
+                collection_name=backup_collection,
+                embedding_function=embeddings
+            )
+            # Copy all documents to backup
+            for doc in documents:
+                backup_vectorstore.add_documents([doc])
+        
+        # Create or update vector store with embeddings
+        vectorstore = PGVector.from_documents(
+            documents=documents,
+            embedding=embeddings,
+            collection_name=collection_name,
             connection_string=database_url,
-            embedding_function=embeddings,
-            collection_name=collection_name
+            pre_delete_collection=True  # Delete existing collection to update with new data
         )
-    
-    # If collection exists but hashes don't match, or collection doesn't exist
-    logger.info(f"Updating collection {collection_name} with new data...")
-    vectorstore = PGVector.from_documents(
-        documents=documents,
-        embedding=embeddings,
-        collection_name=collection_name,
-        connection_string=database_url,
-        pre_delete_collection=True  # Delete existing collection to update with new data
-    )
-    
-    # Update stored hash
-    run_async(update_stored_hash(database_url, collection_name, current_hash))
-    
-    logger.info("Vector store initialization complete!")
-    return vectorstore
+        
+        # Update stored hash
+        run_async(update_stored_hash(database_url, collection_name, current_hash))
+        
+        # Update query vector store
+        global query_vectorstore
+        query_vectorstore = vectorstore
+        
+        logger.info("Vector store initialization complete!")
+        return vectorstore
+        
+    except Exception as e:
+        logger.error(f"Error updating collection: {str(e)}")
+        # If we have a backup, restore it
+        if exists:
+            logger.info("Restoring from backup...")
+            backup_vectorstore = PGVector(
+                connection_string=database_url,
+                collection_name=backup_collection,
+                embedding_function=embeddings
+            )
+            # Copy all documents back
+            for doc in documents:
+                backup_vectorstore.add_documents([doc])
+            return backup_vectorstore
+        raise
 
 # Initialize vector store during app startup
 logger.info("Starting application initialization...")
@@ -360,8 +484,18 @@ def test_db():
 @app.teardown_appcontext
 async def close_db_pool(error):
     """Close the database pool when the application shuts down"""
+    global embeddings, query_vectorstore
     if hasattr(app, 'db_pool'):
         await app.db_pool.close()
+    # Clean up embeddings and query vector store
+    if query_vectorstore is not None:
+        del query_vectorstore
+        query_vectorstore = None
+    if embeddings is not None:
+        del embeddings
+        embeddings = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     # Get port dynamically from Render's environment or default to 8000
