@@ -371,32 +371,30 @@ def home():
         "environment": "development"
     })
 
-@app.route('/ask', methods=['POST'])
+@app.route("/ask", methods=["POST", "OPTIONS"])
 def ask():
-    user_input = request.json.get('query', '')
-    if not user_input:
-        return jsonify({"error": "No query provided"}), 400
-    
+    # Handle preflight requests
+    if request.method == "OPTIONS":
+        return "", 204
+
     try:
-        # Get response from Together AI
-        response = client.chat.completions.create(
-            model=os.getenv('MODEL_NAME', 'meta-llama/Llama-3.3-70B-Instruct-Turbo'),
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant that helps users find relevant projects based on their queries. You have access to project data and can provide detailed information about projects that match the user's interests."},
-                {"role": "user", "content": user_input}
-            ],
-            max_tokens=1024,
-            temperature=0.7,
-            top_p=0.7,
-            top_k=50,
-            repetition_penalty=1,
-        )
+        print("Received request:", request.get_json())
+        data = request.get_json()
+        if not data or "query" not in data:
+            return jsonify({"error": "Query is required"}), 400
+
+        user_input = data["query"]
+        if not user_input:
+            return jsonify({"error": "Query cannot be empty"}), 400
+
+        print("Processing query:", user_input)
         
         # Get relevant projects from vector store
+        project_info = ""
         if vectorstore:
             try:
                 relevant_projects = vectorstore.similarity_search(user_input, k=3)
-                # Format project information
+                # Format project information with detailed metadata
                 project_info = "\n\nRelevant Projects:\n"
                 for i, project in enumerate(relevant_projects, 1):
                     project_info += f"\n{i}. {project.metadata.get('title', 'Untitled Project')}\n"
@@ -404,18 +402,51 @@ def ask():
                     if project.metadata.get('contact_email'):
                         project_info += f"   Contact: {project.metadata['contact_email']}\n"
                     project_info += f"   Link: {project.metadata.get('link', 'N/A')}\n"
-                
-                # Add project information to the response
-                response.choices[0].message.content += project_info
             except Exception as e:
-                logger.error(f"Error getting relevant projects: {str(e)}")
+                print(f"Error accessing vector store: {str(e)}")
+        
+        # Create enhanced prompt with project information
+        prompt = f"""
+You are an AI assistant for the **Art of Living**, dedicated to spreading peace, well-being, and service.
+
+### INSTRUCTIONS
+1️⃣ Recommend specific projects from the database.  
+2️⃣ Match based on location, interests, and budget.  
+3️⃣ For **donations**, only show projects within budget.  
+4️⃣ If no exact match, suggest the closest options with a reason.  
+5️⃣ For **volunteering**, match based on location and skills.  
+6️⃣ Never invent projects.
+
+### Relevant Projects:
+{project_info}
+
+User Query: {user_input}
+"""
+
+        print("Sending request to Together AI")
+        response = client.chat.completions.create(
+            model=os.getenv('MODEL_NAME', 'togethercomputer/llama-2-70b-chat'),
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant that helps users find relevant projects based on their queries. You have access to project data and can provide detailed information about projects that match the user's interests."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1024,
+            temperature=0.7,
+            top_p=0.7,
+            top_k=50,
+            repetition_penalty=1,
+        )
+
+        full_response = response.choices[0].message.content
+        print("Received response from Together AI")
         
         return jsonify({
-            "response": response.choices[0].message.content
+            "response": full_response,
+            "environment": "production" if os.getenv('FLASK_ENV') == 'production' else "development"
         })
-        
+
     except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
+        print(f"Error processing request: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/test-db', methods=['GET'])
