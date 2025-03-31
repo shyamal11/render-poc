@@ -10,9 +10,8 @@ from langchain_core.documents import Document
 import torch
 from transformers import AutoModel, AutoTokenizer
 from langchain_core.embeddings import Embeddings
-import asyncpg
+import psycopg2
 import hashlib
-import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -30,23 +29,9 @@ client.api_key = os.getenv('TOGETHER_API_KEY')
 # Configure CORS
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Create an event loop for async operations
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# Global embeddings instance
-embeddings = None
-query_vectorstore = None
-
-async def get_db_pool():
-    """Get a connection pool for the database"""
-    if not hasattr(app, 'db_pool'):
-        app.db_pool = await asyncpg.create_pool(os.getenv('DATABASE_URL'))
-    return app.db_pool
-
-def run_async(coro):
-    """Helper function to run async code in sync context"""
-    return asyncio.get_event_loop().run_until_complete(coro)
+def get_db_connection():
+    """Get a database connection"""
+    return psycopg2.connect(os.getenv('DATABASE_URL'))
 
 def get_file_hash(file_path):
     """Calculate MD5 hash of a file"""
@@ -137,29 +122,6 @@ class NomicEmbeddings(Embeddings):
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
 
-def get_embeddings():
-    """Get or create the embeddings instance"""
-    global embeddings
-    if embeddings is None:
-        logger.info("Creating new embeddings instance...")
-        embeddings = NomicEmbeddings()
-    return embeddings
-
-def get_query_vectorstore():
-    """Get or create the query vector store with embeddings"""
-    global query_vectorstore, embeddings
-    if query_vectorstore is None:
-        logger.info("Creating query vector store...")
-        embeddings = get_embeddings()
-        collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
-        database_url = os.getenv('DATABASE_URL')
-        query_vectorstore = PGVector(
-            connection_string=database_url,
-            collection_name=collection_name,
-            embedding_function=embeddings
-        )
-    return query_vectorstore
-
 def load_documents():
     """
     Load data from Excel file and convert to LangChain documents
@@ -208,68 +170,109 @@ def load_documents():
         print(f"Error loading data: {str(e)}")
         raise
 
-async def collection_exists(connection_string: str, collection_name: str) -> bool:
+def collection_exists(connection_string: str, collection_name: str) -> bool:
     """Check if the collection exists in the database"""
     try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            exists = await conn.fetchval("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = $1
-                );
-            """, collection_name)
-            return exists
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = %s
+            );
+        """, (collection_name,))
+        exists = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return exists
     except Exception as e:
         logger.error(f"Error checking collection existence: {str(e)}")
         return False
 
-async def get_stored_hash(connection_string: str, collection_name: str) -> str:
+def get_stored_hash(connection_string: str, collection_name: str) -> str:
     """Get the stored hash of the Excel file from the database"""
     try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            # Check if hash table exists
-            table_exists = await conn.fetchval("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'file_hashes'
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Check if hash table exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'file_hashes'
+            );
+        """)
+        table_exists = cur.fetchone()[0]
+        
+        if not table_exists:
+            # Create hash table if it doesn't exist
+            cur.execute("""
+                CREATE TABLE file_hashes (
+                    collection_name TEXT PRIMARY KEY,
+                    file_hash TEXT NOT NULL
                 );
             """)
-            
-            if not table_exists:
-                # Create hash table if it doesn't exist
-                await conn.execute("""
-                    CREATE TABLE file_hashes (
-                        collection_name TEXT PRIMARY KEY,
-                        file_hash TEXT NOT NULL
-                    );
-                """)
-                return None
-            
-            # Get stored hash
-            return await conn.fetchval("""
-                SELECT file_hash FROM file_hashes WHERE collection_name = $1;
-            """, collection_name)
+            conn.commit()
+            cur.close()
+            conn.close()
+            return None
+        
+        # Get stored hash
+        cur.execute("""
+            SELECT file_hash FROM file_hashes WHERE collection_name = %s;
+        """, (collection_name,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result[0] if result else None
     except Exception as e:
         logger.error(f"Error getting stored hash: {str(e)}")
         return None
 
-async def update_stored_hash(connection_string: str, collection_name: str, file_hash: str):
+def update_stored_hash(connection_string: str, collection_name: str, file_hash: str):
     """Update the stored hash of the Excel file in the database"""
     try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO file_hashes (collection_name, file_hash)
-                VALUES ($1, $2)
-                ON CONFLICT (collection_name) 
-                DO UPDATE SET file_hash = EXCLUDED.file_hash;
-            """, collection_name, file_hash)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO file_hashes (collection_name, file_hash)
+            VALUES (%s, %s)
+            ON CONFLICT (collection_name) 
+            DO UPDATE SET file_hash = EXCLUDED.file_hash;
+        """, (collection_name, file_hash))
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
         logger.error(f"Error updating stored hash: {str(e)}")
 
-# Initialize vector store
+# Global embeddings instance
+embeddings = None
+query_vectorstore = None
+
+def get_embeddings():
+    """Get or create the embeddings instance"""
+    global embeddings
+    if embeddings is None:
+        logger.info("Creating new embeddings instance...")
+        embeddings = NomicEmbeddings()
+    return embeddings
+
+def get_query_vectorstore():
+    """Get or create the query vector store with embeddings"""
+    global query_vectorstore, embeddings
+    if query_vectorstore is None:
+        logger.info("Creating query vector store...")
+        embeddings = get_embeddings()
+        collection_name = os.getenv('COLLECTION_NAME', 'langchain_pg_collection')
+        database_url = os.getenv('DATABASE_URL')
+        query_vectorstore = PGVector(
+            connection_string=database_url,
+            collection_name=collection_name,
+            embedding_function=embeddings
+        )
+    return query_vectorstore
+
 def init_vectorstore():
     # Get the data directory path
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -278,17 +281,17 @@ def init_vectorstore():
     os.makedirs(data_dir, exist_ok=True)
     
     # Get collection name and database URL
-    collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
+    collection_name = os.getenv('COLLECTION_NAME', 'langchain_pg_collection')
     database_url = os.getenv('DATABASE_URL')
     
     # First check if collection exists and get stored hash
-    exists = run_async(collection_exists(database_url, collection_name))
-    stored_hash = run_async(get_stored_hash(database_url, collection_name))
+    exists = collection_exists(database_url, collection_name)
+    stored_hash = get_stored_hash(database_url, collection_name)
     
     # If collection exists, check if we need to update
     if exists:
         # Get current file hash without loading the data
-        excel_path = os.path.join(data_dir, "Data Sample for Altro AI.xlsx")
+        excel_path = os.path.join(data_dir, "Data Sample for Altro AI-1.xlsx")
         current_hash = get_file_hash(excel_path)
         
         # If hashes match, just return the query vector store
@@ -327,7 +330,7 @@ def init_vectorstore():
         )
         
         # Update stored hash
-        run_async(update_stored_hash(database_url, collection_name, current_hash))
+        update_stored_hash(database_url, collection_name, current_hash)
         
         # Update query vector store
         global query_vectorstore
@@ -365,137 +368,102 @@ except Exception as e:
 def home():
     return jsonify({
         "message": "Art of Living Chatbot API is running",
-        "environment": "production" if os.getenv('FLASK_ENV') == 'production' else "development"
+        "environment": "development"
     })
 
-@app.route("/ask", methods=["POST", "OPTIONS"])
+@app.route('/ask', methods=['POST'])
 def ask():
-    # Handle preflight requests
-    if request.method == "OPTIONS":
-        return "", 204
-
+    user_input = request.json.get('query', '')
+    if not user_input:
+        return jsonify({"error": "No query provided"}), 400
+    
     try:
-        print("Received request:", request.get_json())
-        data = request.get_json()
-        if not data or "query" not in data:
-            return jsonify({"error": "Query is required"}), 400
-
-        user_input = data["query"]
-        if not user_input:
-            return jsonify({"error": "Query cannot be empty"}), 400
-
-        print("Processing query:", user_input)
+        # Get response from Together AI
+        response = client.chat.completions.create(
+            model=os.getenv('MODEL_NAME', 'meta-llama/Llama-3.3-70B-Instruct-Turbo'),
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant that helps users find relevant projects based on their queries. You have access to project data and can provide detailed information about projects that match the user's interests."},
+                {"role": "user", "content": user_input}
+            ],
+            max_tokens=1024,
+            temperature=0.7,
+            top_p=0.7,
+            top_k=50,
+            repetition_penalty=1,
+        )
         
         # Get relevant projects from vector store
-        projects_info = ""
         if vectorstore:
             try:
                 relevant_projects = vectorstore.similarity_search(user_input, k=3)
-                projects_info = "\n\n".join([
-                    f"**{doc.metadata['title']}**\n- {doc.page_content}" for doc in relevant_projects
-                ])
+                # Format project information
+                project_info = "\n\nRelevant Projects:\n"
+                for i, project in enumerate(relevant_projects, 1):
+                    project_info += f"\n{i}. {project.metadata.get('title', 'Untitled Project')}\n"
+                    project_info += f"   Description: {project.page_content}\n"
+                    if project.metadata.get('contact_email'):
+                        project_info += f"   Contact: {project.metadata['contact_email']}\n"
+                    project_info += f"   Link: {project.metadata.get('link', 'N/A')}\n"
+                
+                # Add project information to the response
+                response.choices[0].message.content += project_info
             except Exception as e:
-                print(f"Error accessing vector store: {str(e)}")
-        
-        # Create prompt with project information
-        prompt = f"""
-You are an AI assistant for the **Art of Living**, dedicated to spreading peace, well-being, and service.
-
-### INSTRUCTIONS
-1️⃣ Recommend specific projects from the database.  
-2️⃣ Match based on location, interests, and budget.  
-3️⃣ For **donations**, only show projects within budget.  
-4️⃣ If no exact match, suggest the closest options with a reason.  
-5️⃣ For **volunteering**, match based on location and skills.  
-6️⃣ Never invent projects.
-
-### Relevant Projects:
-{projects_info}
-
-User Query: {user_input}
-"""
-
-        print("Sending request to Together AI")
-        stream = client.chat.completions.create(
-            model=os.getenv('MODEL_NAME', 'togethercomputer/llama-2-70b-chat'),
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        full_response = stream.choices[0].message.content
-        print("Received response from Together AI")
+                logger.error(f"Error getting relevant projects: {str(e)}")
         
         return jsonify({
-            "response": full_response,
-            "environment": "production" if os.getenv('FLASK_ENV') == 'production' else "development"
+            "response": response.choices[0].message.content
         })
-
+        
     except Exception as e:
-        print(f"Error processing request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        logger.error(f"Error processing request: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/test-db')
+@app.route('/test-db', methods=['GET'])
 def test_db():
     """Test database connection and collection status"""
     try:
-        collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
         database_url = os.getenv('DATABASE_URL')
         
-        # Test database connection and collection existence
-        exists = run_async(collection_exists(database_url, collection_name))
+        # Get all collections (tables) in the database
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public'
+            AND table_type = 'BASE TABLE';
+        """)
+        collections = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
         
-        # Get current and stored hashes
-        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-        excel_path = os.path.join(data_dir, "Data Sample for Altro AI.xlsx")
-        current_hash = get_file_hash(excel_path)
-        stored_hash = run_async(get_stored_hash(database_url, collection_name))
-        
-        # Get collection size if it exists
-        collection_size = None
-        if exists:
-            pool = run_async(get_db_pool())
-            async def get_collection_size():
-                async with pool.acquire() as conn:
-                    return await conn.fetchval(f"""
-                        SELECT COUNT(*) FROM {collection_name};
-                    """)
-            collection_size = run_async(get_collection_size())
+        # Get collection sizes
+        collection_sizes = {}
+        for collection in collections:
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute(f"SELECT COUNT(*) FROM {collection}")
+                collection_sizes[collection] = cur.fetchone()[0]
+                cur.close()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error getting size for collection {collection}: {str(e)}")
+                collection_sizes[collection] = "error"
         
         return jsonify({
-            "database_connection": "success",
-            "collection_exists": exists,
-            "collection_name": collection_name,
-            "collection_size": collection_size,
-            "hash_table": {
-                "current_file_hash": current_hash,
-                "stored_hash": stored_hash,
-                "needs_update": current_hash != stored_hash if stored_hash else True
-            }
+            "status": "success",
+            "database_connection": "ok",
+            "available_collections": collections,
+            "collection_sizes": collection_sizes
         })
+        
     except Exception as e:
-        logger.error(f"Error testing database: {str(e)}")
+        logger.error(f"Database test failed: {str(e)}")
         return jsonify({
-            "error": "Database test failed",
-            "details": str(e)
+            "status": "error",
+            "error": str(e)
         }), 500
-
-@app.teardown_appcontext
-async def close_db_pool(error):
-    """Close the database pool when the application shuts down"""
-    global embeddings, query_vectorstore
-    if hasattr(app, 'db_pool'):
-        await app.db_pool.close()
-    # Clean up embeddings and query vector store
-    if query_vectorstore is not None:
-        del query_vectorstore
-        query_vectorstore = None
-    if embeddings is not None:
-        del embeddings
-        embeddings = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     # Get port dynamically from Render's environment or default to 8000
