@@ -10,6 +10,9 @@ from langchain_core.documents import Document
 import torch
 from transformers import AutoModel, AutoTokenizer
 from langchain_core.embeddings import Embeddings
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +29,14 @@ client.api_key = os.getenv('TOGETHER_API_KEY')
 
 # Configure CORS
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+def get_file_hash(file_path):
+    """Calculate MD5 hash of a file"""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
 class NomicEmbeddings(Embeddings):
     def __init__(self):
@@ -89,11 +100,91 @@ def load_documents():
                 documents.append(Document(page_content=desc, metadata=metadata))
         
         print(f"Loaded {len(documents)} documents from Excel file")
-        return documents
+        return documents, get_file_hash(excel_path)
         
     except Exception as e:
         print(f"Error loading data: {str(e)}")
         raise
+
+def collection_exists(connection_string: str, collection_name: str) -> bool:
+    """Check if the collection exists in the database"""
+    try:
+        conn = psycopg2.connect(connection_string)
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Check if the collection exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = %s
+            );
+        """, (collection_name,))
+        
+        exists = cur.fetchone()['exists']
+        cur.close()
+        conn.close()
+        return exists
+    except Exception as e:
+        print(f"Error checking collection existence: {str(e)}")
+        return False
+
+def get_stored_hash(connection_string: str, collection_name: str) -> str:
+    """Get the stored hash of the Excel file from the database"""
+    try:
+        conn = psycopg2.connect(connection_string)
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Check if hash table exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'file_hashes'
+            );
+        """)
+        
+        if not cur.fetchone()['exists']:
+            # Create hash table if it doesn't exist
+            cur.execute("""
+                CREATE TABLE file_hashes (
+                    collection_name TEXT PRIMARY KEY,
+                    file_hash TEXT NOT NULL
+                );
+            """)
+            conn.commit()
+            return None
+        
+        # Get stored hash
+        cur.execute("""
+            SELECT file_hash FROM file_hashes WHERE collection_name = %s;
+        """, (collection_name,))
+        
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result['file_hash'] if result else None
+    except Exception as e:
+        print(f"Error getting stored hash: {str(e)}")
+        return None
+
+def update_stored_hash(connection_string: str, collection_name: str, file_hash: str):
+    """Update the stored hash of the Excel file in the database"""
+    try:
+        conn = psycopg2.connect(connection_string)
+        cur = conn.cursor()
+        
+        # Update or insert hash
+        cur.execute("""
+            INSERT INTO file_hashes (collection_name, file_hash)
+            VALUES (%s, %s)
+            ON CONFLICT (collection_name) 
+            DO UPDATE SET file_hash = EXCLUDED.file_hash;
+        """, (collection_name, file_hash))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating stored hash: {str(e)}")
 
 # Initialize vector store
 def init_vectorstore():
@@ -106,14 +197,37 @@ def init_vectorstore():
     # Initialize embeddings
     embeddings = NomicEmbeddings()
     
-    # Initialize or get existing vector store
+    # Get collection name and database URL
+    collection_name = os.getenv('COLLECTION_NAME', 'art_of_living_projects')
+    database_url = os.getenv('DATABASE_URL')
+    
+    # Load documents and get current file hash
+    documents, current_hash = load_documents()
+    
+    # Check if collection exists and get stored hash
+    stored_hash = get_stored_hash(database_url, collection_name)
+    
+    # If collection exists and hashes match, just return the existing vectorstore
+    if collection_exists(database_url, collection_name) and stored_hash == current_hash:
+        print(f"Collection {collection_name} exists and data is up to date")
+        return PGVector(
+            connection_string=database_url,
+            embedding_function=embeddings,
+            collection_name=collection_name
+        )
+    
+    # If collection exists but hashes don't match, or collection doesn't exist
+    print(f"Updating collection {collection_name} with new data...")
     vectorstore = PGVector.from_documents(
-        documents=load_documents(),
+        documents=documents,
         embedding=embeddings,
-        collection_name=os.getenv('COLLECTION_NAME', 'art_of_living_projects'),
-        connection_string=os.getenv('DATABASE_URL'),
-        pre_delete_collection=True
+        collection_name=collection_name,
+        connection_string=database_url,
+        pre_delete_collection=True  # Delete existing collection to update with new data
     )
+    
+    # Update stored hash
+    update_stored_hash(database_url, collection_name, current_hash)
     
     print("Vector store initialization complete!")
     return vectorstore

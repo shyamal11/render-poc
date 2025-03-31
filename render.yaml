@@ -1,15 +1,21 @@
 services:
   - type: web
-    name: flask-app
+    name: art-of-living-chatbot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.0
-      - key: FLASK_ENV
-        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: TOGETHER_API_KEY
+        sync: false
       - key: MODEL_NAME
         value: togethercomputer/llama-2-70b-chat
-      - key: TOGETHER_API_KEY
-        sync: false 
+      - key: COLLECTION_NAME
+        value: art_of_living_projects
+      - key: PORT
+        value: 8000
+    healthCheckPath: /
+    autoDeploy: true 
