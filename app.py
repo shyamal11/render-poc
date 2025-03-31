@@ -5,9 +5,11 @@ import os
 import logging
 from dotenv import load_dotenv
 import pandas as pd
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.docstore.document import Document
+from langchain_community.vectorstores import PGVector
+from langchain_core.documents import Document
+import torch
+from transformers import AutoModel, AutoTokenizer
+from langchain_core.embeddings import Embeddings
 
 # Load environment variables
 load_dotenv()
@@ -25,35 +27,27 @@ client.api_key = os.getenv('TOGETHER_API_KEY')
 # Configure CORS
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Initialize vector store
-def init_vectorstore():
-    # Get the data directory path
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-    
-    # Create data directory if it doesn't exist
-    os.makedirs(data_dir, exist_ok=True)
-    
-    # Initialize embeddings
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    
-    # Initialize or get existing vector store
-    vectorstore = Chroma(
-        persist_directory=os.path.join(data_dir, 'chroma'),
-        embedding_function=embeddings,
-        collection_name=os.getenv('COLLECTION_NAME', 'art_of_living_projects')
-    )
-    
-    # Load data if the collection is empty
-    if vectorstore._collection.count() == 0:
-        print("Loading data into vector store...")
-        documents = load_data()
-        vectorstore.add_documents(documents)
-        vectorstore.persist()
-        print("Data loaded successfully!")
-    
-    return vectorstore
+class NomicEmbeddings(Embeddings):
+    def __init__(self):
+        self.model_name = "nomic-ai/nomic-embed-text-v1.5"
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(self.model_name, trust_remote_code=True)
+        self.max_length = 8192
 
-def load_data():
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        texts = [str(t) for t in texts]
+        encoded_input = self.tokenizer(
+            texts, padding=True, truncation=True, max_length=self.max_length, return_tensors='pt'
+        )
+        with torch.no_grad():
+            outputs = self.model(**encoded_input)
+        embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+def load_documents():
     """
     Load data from Excel file and convert to LangChain documents
     """
@@ -63,38 +57,36 @@ def load_data():
         excel_path = os.path.join(data_dir, "Data Sample for Altro AI.xlsx")
         
         # Read Excel file
-        df = pd.read_excel(excel_path, sheet_name="REAL and Mocked up Data for POC")
+        xls = pd.ExcelFile(excel_path)
+        data = pd.read_excel(xls, "REAL and Mocked up Data for POC").fillna("")
         
-        # Convert DataFrame to documents
         documents = []
-        for _, row in df.iterrows():
-            # Create document content
-            content = f"""
-            Title: {row.get('Project title', '')}
-            Description: {row.get('Generated Description', '')}
-            Location: {row.get('Project Locations', '')}
-            Target Group: {row.get('Target group', '')}
-            Contact Person: {row.get('Contact Person', '')}
-            Volunteer Needs: {row.get('Volunteer Needs', '')}
-            Donation Needs: {row.get('Donation Needs', '')}
-            """
-            
-            # Create metadata
+        for _, row in data.iterrows():
+            def safe(field):
+                val = row.get(field, "")
+                return "" if pd.isna(val) else str(val)
+
             metadata = {
-                'title': row.get('Project title', ''),
-                'location': row.get('Project Locations', ''),
-                'target_group': row.get('Target group', ''),
-                'contact_person': row.get('Contact Person', ''),
-                'volunteer_needs': row.get('Volunteer Needs', ''),
-                'donation_needs': row.get('Donation Needs', '')
+                "title": safe("Project title"),
+                "link": safe("Links/Sources"),
+                "locations": safe("Project Locations"),
+                "target_group": safe("Target group"),
+                "persona": safe("Persona"),
+                "contact_person": safe("Contact Person"),
+                "contact_title": safe("Contact Person Title"),
+                "contact_email": safe("Contact Person email"),
+                "volunteer_needs": safe("Volunteer Needs"),
+                "volunteer_need_by": safe("Volunteer Need by (mm/dd/yyyy)"),
+                "tenure": safe("Tenure"),
+                "responsibilities": safe("Responsbilities"),
+                "donation_needs": safe("Donation Needs"),
+                "donation_amount": safe("Donation Amount ($)"),
+                "donation_need_by": safe("Donation Need by"),
             }
-            
-            # Create document
-            doc = Document(
-                page_content=content,
-                metadata=metadata
-            )
-            documents.append(doc)
+
+            desc = row.get("Generated Description", "")
+            if desc and isinstance(desc, str):
+                documents.append(Document(page_content=desc, metadata=metadata))
         
         print(f"Loaded {len(documents)} documents from Excel file")
         return documents
@@ -102,6 +94,29 @@ def load_data():
     except Exception as e:
         print(f"Error loading data: {str(e)}")
         raise
+
+# Initialize vector store
+def init_vectorstore():
+    # Get the data directory path
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+    
+    # Create data directory if it doesn't exist
+    os.makedirs(data_dir, exist_ok=True)
+    
+    # Initialize embeddings
+    embeddings = NomicEmbeddings()
+    
+    # Initialize or get existing vector store
+    vectorstore = PGVector.from_documents(
+        documents=load_documents(),
+        embedding=embeddings,
+        collection_name=os.getenv('COLLECTION_NAME', 'art_of_living_projects'),
+        connection_string=os.getenv('DATABASE_URL'),
+        pre_delete_collection=True
+    )
+    
+    print("Vector store initialization complete!")
+    return vectorstore
 
 # Initialize vector store during app startup
 logger.info("Starting application initialization...")

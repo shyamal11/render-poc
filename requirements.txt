@@ -4,7 +4,10 @@ flask-cors
 python-dotenv
 together
 langchain
-chromadb
+langchain-community
+langchain-core
+psycopg2-binary
 pandas
 openpyxl
-sentence-transformers
+torch
+transformers
