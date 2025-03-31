@@ -1,2 +1,9 @@
 Flask
 Gunicorn
+flask-cors
+python-dotenv
+together
+langchain
+chromadb
+pandas
+openpyxl
