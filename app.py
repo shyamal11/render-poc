@@ -567,14 +567,42 @@ def restore_from_backup(database_url: str, backup_name: str, target_name: str) -
         logger.error(f"Error restoring from backup: {str(e)}")
         return False
 
+def cleanup_and_init_db():
+    """Clean up existing collections and initialize a fresh database"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        collection_name = get_collection_name()
+        
+        # Drop existing collection and related tables with CASCADE
+        cur.execute(f"DROP TABLE IF EXISTS {collection_name} CASCADE")
+        cur.execute("DROP TABLE IF EXISTS langchain_pg_collection CASCADE")
+        cur.execute("DROP TABLE IF EXISTS langchain_pg_embedding CASCADE")
+        cur.execute("DROP TABLE IF EXISTS file_hashes CASCADE")
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        logger.info("Cleaned up existing database tables")
+        
+        # Initialize fresh vector store
+        return init_vectorstore()
+        
+    except Exception as e:
+        logger.error(f"Error during database cleanup and initialization: {str(e)}")
+        raise
+
 # Initialize vector store during app startup
 logger.info("Starting application initialization...")
 try:
-    # Uncomment the following line to clean up and reinitialize the database
+    # Choose one of these options:
+    # Option 1: Clean up and reinitialize the database (for development only)
     # vectorstore = cleanup_and_init_db()
     
-    # Or use normal initialization
+    # Option 2: Normal initialization (preserves existing data) - Use this in production
     vectorstore = init_vectorstore()
+    
     logger.info("Vector store initialization complete!")
 except Exception as e:
     logger.error(f"Error initializing vector store: {str(e)}")
