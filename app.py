@@ -7,13 +7,12 @@ from dotenv import load_dotenv
 import pandas as pd
 from langchain_community.vectorstores import PGVector
 from langchain_core.documents import Document
-import torch
-from transformers import AutoModel, AutoTokenizer
 from langchain_core.embeddings import Embeddings
 import psycopg2
 import hashlib
 import time
 import json
+from typing import List
 
 # Load environment variables
 load_dotenv()
@@ -43,86 +42,51 @@ def get_file_hash(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-class NomicEmbeddings(Embeddings):
+class TogetherAIEmbeddings(Embeddings):
     def __init__(self):
-        self.model_name = "nomic-ai/nomic-embed-text-v1.5"
-        self.max_length = 8192
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model_name = "togethercomputer/m2-bert-80M-8k-retrieval"  # Good for retrieval tasks
+        # Alternatively: "togethercomputer/m2-bert-80M-2k-retrieval" for shorter documents
+        self.api_key = os.getenv('TOGETHER_API_KEY')
+        if not self.api_key:
+            raise ValueError("TOGETHER_API_KEY environment variable not set")
         
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed multiple texts using TogetherAI API"""
         try:
-            # Load model with memory optimizations
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name, 
-                trust_remote_code=True
-            )
+            # Batch process texts to be more efficient
+            batch_size = 32  # Adjust based on API limits
+            embeddings = []
             
-            self.model = AutoModel.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-                device_map="auto",  # Automatically handle model placement
-                torch_dtype=torch.float16,  # Use half precision
-                low_cpu_mem_usage=True  # Optimize memory usage
-            )
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                response = client.embeddings.create(
+                    input=batch,
+                    model=self.model_name
+                )
+                batch_embeddings = [emb.embedding for emb in response.data]
+                embeddings.extend(batch_embeddings)
             
-            # Move model to appropriate device
-            self.model = self.model.to(self.device)
-            
-            # Enable evaluation mode
-            self.model.eval()
+            return embeddings
             
         except Exception as e:
-            logger.error(f"Error initializing model: {str(e)}")
-            # Clear CUDA cache if available
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            logger.error(f"Error embedding documents: {str(e)}")
             raise
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query using TogetherAI API"""
         try:
-            texts = [str(t) for t in texts]
-            encoded_input = self.tokenizer(
-                texts, 
-                padding=True, 
-                truncation=True, 
-                max_length=self.max_length, 
-                return_tensors='pt'
+            response = client.embeddings.create(
+                input=[text],
+                model=self.model_name
             )
-            
-            # Move inputs to the same device as the model
-            encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
-            
-            with torch.no_grad():
-                outputs = self.model(**encoded_input)
-            
-            # Get embeddings and move to CPU
-            embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-            
-            # Clear CUDA cache if available
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            return embeddings.tolist()
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                logger.error("Out of memory error occurred. Clearing cache and retrying...")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                raise
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error embedding query: {str(e)}")
             raise
-
-    def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]
         
     def __del__(self):
         """Cleanup when the object is destroyed"""
-        try:
-            if hasattr(self, 'model'):
-                del self.model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
+        pass  # No special cleanup needed for API-based embeddings
 
 def load_documents():
     """
@@ -168,8 +132,6 @@ def load_documents():
                     page_content=desc,
                     metadata=metadata
                 )
-                
-             
                 
                 documents.append(doc)
         
@@ -316,8 +278,8 @@ def get_embeddings():
     """Get or create the embeddings instance"""
     global embeddings
     if embeddings is None:
-        logger.info("Creating new embeddings instance...")
-        embeddings = NomicEmbeddings()
+        logger.info("Creating new TogetherAI embeddings instance...")
+        embeddings = TogetherAIEmbeddings()
     return embeddings
 
 def get_collection_name() -> str:
