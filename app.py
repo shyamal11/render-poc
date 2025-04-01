@@ -622,25 +622,39 @@ def ask():
         return "", 204
 
     try:
-        print("Received request:", request.get_json())
+        print("\n=== Starting New Request ===")
+        print("Request Headers:", dict(request.headers))
+        print("Request Body:", request.get_json())
+        
         data = request.get_json()
         if not data or "query" not in data:
+            print("Error: No query in request data")
             return jsonify({"error": "Query is required"}), 400
 
         user_input = data["query"]
         if not user_input:
+            print("Error: Empty query")
             return jsonify({"error": "Query cannot be empty"}), 400
 
-        print("Processing query:", user_input)
+        print("\n=== Processing Query ===")
+        print("User Input:", user_input)
         
         # Get relevant projects from vector store
         project_info = ""
         if vectorstore:
             try:
+                print("\n=== Vector Store Search ===")
                 relevant_projects = vectorstore.similarity_search(user_input, k=3)
+                print(f"Found {len(relevant_projects)} relevant projects")
+                
                 # Format project information with detailed metadata
                 project_info = "\n\nRelevant Projects:\n"
                 for i, project in enumerate(relevant_projects, 1):
+                    print(f"\nProject {i}:")
+                    print(f"Title: {project.metadata.get('title', 'Untitled Project')}")
+                    print(f"Description: {project.page_content[:100]}...")  # First 100 chars
+                    print(f"Metadata: {project.metadata}")
+                    
                     project_info += f"\n{i}. {project.metadata.get('title', 'Untitled Project')}\n"
                     project_info += f"   Description: {project.page_content}\n"
                     if project.metadata.get('contact_email'):
@@ -648,6 +662,7 @@ def ask():
                     project_info += f"   Link: {project.metadata.get('link', 'N/A')}\n"
             except Exception as e:
                 print(f"Error accessing vector store: {str(e)}")
+                print("Full error details:", e.__dict__)
         
         # Create enhanced prompt with project information
         prompt = f"""
@@ -667,7 +682,9 @@ You are an AI assistant for the **Art of Living**, dedicated to spreading peace,
 User Query: {user_input}
 """
 
-        print("Sending request to Together AI")
+        print("\n=== Sending to Together AI ===")
+        print("Prompt:", prompt)
+        
         response = client.chat.completions.create(
             model=os.getenv('MODEL_NAME'),
             messages=[
@@ -682,7 +699,8 @@ User Query: {user_input}
         )
 
         full_response = response.choices[0].message.content
-        print("Received response from Together AI")
+        print("\n=== Together AI Response ===")
+        print("Response:", full_response)
         
         return jsonify({
             "response": full_response,
@@ -690,7 +708,10 @@ User Query: {user_input}
         })
 
     except Exception as e:
-        print(f"Error processing request: {str(e)}")
+        print("\n=== Error Occurred ===")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
+        print("Full error details:", e.__dict__)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/test-db')
