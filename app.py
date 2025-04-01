@@ -12,6 +12,8 @@ from transformers import AutoModel, AutoTokenizer
 from langchain_core.embeddings import Embeddings
 import psycopg2
 import hashlib
+import time
+import json
 
 # Load environment variables
 load_dotenv()
@@ -161,13 +163,45 @@ def load_documents():
 
             desc = row.get("Generated Description", "")
             if desc and isinstance(desc, str):
-                documents.append(Document(page_content=desc, metadata=metadata))
+                # Create document with full metadata
+                doc = Document(
+                    page_content=desc,
+                    metadata=metadata
+                )
+                
+             
+                
+                documents.append(doc)
         
         print(f"Loaded {len(documents)} documents from Excel file")
         return documents, get_file_hash(excel_path)
         
     except Exception as e:
         print(f"Error loading data: {str(e)}")
+        raise
+
+def get_collection_id() -> str:
+    """Get the UUID of the current collection"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        collection_name = get_collection_name()
+        
+        cur.execute("""
+            SELECT uuid FROM langchain_pg_collection WHERE name = %s;
+        """, (collection_name,))
+        
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if result:
+            return result[0]
+        else:
+            raise Exception(f"Collection {collection_name} not found")
+            
+    except Exception as e:
+        logger.error(f"Error getting collection ID: {str(e)}")
         raise
 
 def collection_exists(connection_string: str, collection_name: str) -> bool:
@@ -205,14 +239,18 @@ def get_stored_hash(connection_string: str, collection_name: str) -> str:
         table_exists = cur.fetchone()[0]
         
         if not table_exists:
+            logger.info("file_hashes table does not exist. Creating it...")
             # Create hash table if it doesn't exist
             cur.execute("""
                 CREATE TABLE file_hashes (
                     collection_name TEXT PRIMARY KEY,
-                    file_hash TEXT NOT NULL
+                    file_hash TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             conn.commit()
+            logger.info("Created file_hashes table")
             cur.close()
             conn.close()
             return None
@@ -222,9 +260,16 @@ def get_stored_hash(connection_string: str, collection_name: str) -> str:
             SELECT file_hash FROM file_hashes WHERE collection_name = %s;
         """, (collection_name,))
         result = cur.fetchone()
+        
+        if result is None:
+            logger.info(f"No hash found for collection: {collection_name}")
+        else:
+            logger.info(f"Found hash for collection: {collection_name}")
+            
         cur.close()
         conn.close()
         return result[0] if result else None
+        
     except Exception as e:
         logger.error(f"Error getting stored hash: {str(e)}")
         return None
@@ -234,17 +279,34 @@ def update_stored_hash(connection_string: str, collection_name: str, file_hash: 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # Ensure file_hashes table exists
         cur.execute("""
-            INSERT INTO file_hashes (collection_name, file_hash)
-            VALUES (%s, %s)
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                collection_name TEXT PRIMARY KEY,
+                file_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        
+        # Update or insert hash
+        cur.execute("""
+            INSERT INTO file_hashes (collection_name, file_hash, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
             ON CONFLICT (collection_name) 
-            DO UPDATE SET file_hash = EXCLUDED.file_hash;
+            DO UPDATE SET 
+                file_hash = EXCLUDED.file_hash,
+                updated_at = CURRENT_TIMESTAMP;
         """, (collection_name, file_hash))
+        
         conn.commit()
+        logger.info(f"Updated hash for collection: {collection_name}")
         cur.close()
         conn.close()
     except Exception as e:
         logger.error(f"Error updating stored hash: {str(e)}")
+        raise
 
 # Global embeddings instance
 embeddings = None
@@ -258,13 +320,23 @@ def get_embeddings():
         embeddings = NomicEmbeddings()
     return embeddings
 
+def get_collection_name() -> str:
+    """Get the collection name from environment variable or use default"""
+    collection_name = os.getenv('COLLECTION_NAME')
+    if not collection_name:
+        logger.info("No COLLECTION_NAME environment variable set. Using default: art_of_living_projects")
+        collection_name = 'art_of_living_projects'
+    else:
+        logger.info(f"Using collection name from environment: {collection_name}")
+    return collection_name
+
 def get_query_vectorstore():
     """Get or create the query vector store with embeddings"""
     global query_vectorstore, embeddings
     if query_vectorstore is None:
         logger.info("Creating query vector store...")
         embeddings = get_embeddings()
-        collection_name = os.getenv('COLLECTION_NAME', 'langchain_pg_collection')
+        collection_name = get_collection_name()
         database_url = os.getenv('DATABASE_URL')
         query_vectorstore = PGVector(
             connection_string=database_url,
@@ -273,91 +345,235 @@ def get_query_vectorstore():
         )
     return query_vectorstore
 
+def verify_collection_integrity(connection_string: str, collection_name: str) -> bool:
+    """Verify the integrity of a collection by checking its structure and content"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Check if collection exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = %s
+            );
+        """, (collection_name,))
+        if not cur.fetchone()[0]:
+            return False
+            
+        # Check if collection has required columns
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = %s;
+        """, (collection_name,))
+        columns = [row[0] for row in cur.fetchall()]
+        required_columns = {'id', 'embedding', 'document', 'metadata'}
+        if not required_columns.issubset(set(columns)):
+            return False
+            
+        # Check if collection has data
+        cur.execute(f"SELECT COUNT(*) FROM {collection_name}")
+        count = cur.fetchone()[0]
+        if count == 0:
+            return False
+            
+        cur.close()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error verifying collection integrity: {str(e)}")
+        return False
+
+def backup_collection(connection_string: str, source_collection: str, backup_collection: str):
+    """Efficiently backup a collection using SQL"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Drop backup collection if it exists
+        cur.execute(f"DROP TABLE IF EXISTS {backup_collection}")
+        
+        # Create backup by copying the entire table
+        cur.execute(f"""
+            CREATE TABLE {backup_collection} AS 
+            SELECT * FROM {source_collection}
+        """)
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error backing up collection: {str(e)}")
+        return False
+
 def init_vectorstore():
-    # Get the data directory path
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-    
-    # Create data directory if it doesn't exist
     os.makedirs(data_dir, exist_ok=True)
     
-    # Get collection name and database URL
-    collection_name = os.getenv('COLLECTION_NAME', 'langchain_pg_collection')
+    collection_name = get_collection_name()
     database_url = os.getenv('DATABASE_URL')
+    excel_path = os.path.join(data_dir, "Data Sample for Altro AI-1.xlsx")
     
-    # First check if collection exists and get stored hash
+    # Check if Excel file exists
+    if not os.path.exists(excel_path):
+        logger.error(f"Excel file not found: {excel_path}")
+        # If collection exists, use it; otherwise raise error
+        if collection_exists(database_url, collection_name):
+            logger.warning("Using existing collection as Excel file is missing")
+            return get_query_vectorstore()
+        raise FileNotFoundError(f"Excel file not found and no existing collection")
+    
     exists = collection_exists(database_url, collection_name)
     stored_hash = get_stored_hash(database_url, collection_name)
-    
-    # If collection exists, check if we need to update
-    if exists:
-        # Get current file hash without loading the data
-        excel_path = os.path.join(data_dir, "Data Sample for Altro AI-1.xlsx")
-        current_hash = get_file_hash(excel_path)
-        
-        # If hashes match, just return the query vector store
-        if stored_hash == current_hash:
-            logger.info(f"Collection {collection_name} exists and data is up to date")
-            return get_query_vectorstore()
-    
-    # Only create embeddings if we need to update the collection
-    logger.info(f"Loading documents and updating collection {collection_name}...")
-    embeddings = get_embeddings()  # Create embeddings only when needed
-    documents, current_hash = load_documents()
+    current_hash = get_file_hash(excel_path)
     
     try:
-        # Create backup collection name
-        backup_collection = f"{collection_name}_backup"
+        # If collection exists and hashes match, verify integrity
+        if exists and stored_hash == current_hash:
+            if verify_collection_integrity(database_url, collection_name):
+                logger.info(f"Collection {collection_name} exists and is up to date")
+                return get_query_vectorstore()
+            else:
+                logger.warning("Collection integrity check failed, will attempt repair")
         
-        # If collection exists, create a backup
+        # Create backup if updating existing collection
         if exists:
-            logger.info(f"Creating backup of collection {collection_name}...")
-            backup_vectorstore = PGVector(
-                connection_string=database_url,
-                collection_name=backup_collection,
-                embedding_function=embeddings
-            )
-            # Copy all documents to backup
-            for doc in documents:
-                backup_vectorstore.add_documents([doc])
+            backup_name = f"{collection_name}_backup_{int(time.time())}"
+            logger.info(f"Creating backup: {backup_name}")
+            if backup_collection(database_url, collection_name, backup_name):
+                # Clean up old backups (keep last 3)
+                cleanup_old_backups(database_url, collection_name, keep_last=3)
+            else:
+                logger.error("Backup creation failed")
+                raise Exception("Failed to create backup before update")
         
-        # Create or update vector store with embeddings
+        # Load and update documents
+        logger.info("Loading documents for update...")
+        documents, _ = load_documents()
+        
+        # Create or update vector store
         vectorstore = PGVector.from_documents(
             documents=documents,
-            embedding=embeddings,
+            embedding=get_embeddings(),
             collection_name=collection_name,
             connection_string=database_url,
-            pre_delete_collection=True  # Delete existing collection to update with new data
+            pre_delete_collection=True,
+            collection_metadata={"name": collection_name}  # Add collection metadata
         )
         
-        # Update stored hash
+        # Verify metadata storage
+        try:
+            test_doc = vectorstore.similarity_search("test", k=1)[0]
+            print(f"Test document metadata after storage: {test_doc.metadata}")
+        except Exception as e:
+            print(f"Error verifying metadata: {str(e)}")
+        
+        # Update hash only after successful update
         update_stored_hash(database_url, collection_name, current_hash)
         
-        # Update query vector store
+        # Update global query store
         global query_vectorstore
         query_vectorstore = vectorstore
         
-        logger.info("Vector store initialization complete!")
+        logger.info("Vector store update complete!")
         return vectorstore
         
     except Exception as e:
-        logger.error(f"Error updating collection: {str(e)}")
-        # If we have a backup, restore it
+        logger.error(f"Error during vector store initialization: {str(e)}")
         if exists:
-            logger.info("Restoring from backup...")
-            backup_vectorstore = PGVector(
-                connection_string=database_url,
-                collection_name=backup_collection,
-                embedding_function=embeddings
-            )
-            # Copy all documents back
-            for doc in documents:
-                backup_vectorstore.add_documents([doc])
-            return backup_vectorstore
+            logger.info("Attempting to restore from latest backup...")
+            latest_backup = get_latest_backup(database_url, collection_name)
+            if latest_backup and restore_from_backup(database_url, latest_backup, collection_name):
+                logger.info("Successfully restored from backup")
+                return get_query_vectorstore()
         raise
+
+def cleanup_old_backups(database_url: str, collection_prefix: str, keep_last: int = 3):
+    """Clean up old backup collections, keeping the specified number of most recent backups"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get all backup collections for this prefix
+        cur.execute("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_name LIKE %s 
+            ORDER BY table_name DESC
+        """, (f"{collection_prefix}_backup_%",))
+        
+        backups = [row[0] for row in cur.fetchall()]
+        
+        # Keep only the specified number of most recent backups
+        for backup in backups[keep_last:]:
+            cur.execute(f"DROP TABLE IF EXISTS {backup}")
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up old backups: {str(e)}")
+
+def get_latest_backup(database_url: str, collection_name: str) -> str:
+    """Get the name of the most recent backup collection"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_name LIKE %s 
+            ORDER BY table_name DESC 
+            LIMIT 1
+        """, (f"{collection_name}_backup_%",))
+        
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        return result[0] if result else None
+        
+    except Exception as e:
+        logger.error(f"Error getting latest backup: {str(e)}")
+        return None
+
+def restore_from_backup(database_url: str, backup_name: str, target_name: str) -> bool:
+    """Restore a collection from a backup"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Drop target if it exists
+        cur.execute(f"DROP TABLE IF EXISTS {target_name}")
+        
+        # Restore from backup
+        cur.execute(f"""
+            CREATE TABLE {target_name} AS 
+            SELECT * FROM {backup_name}
+        """)
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error restoring from backup: {str(e)}")
+        return False
 
 # Initialize vector store during app startup
 logger.info("Starting application initialization...")
 try:
+    # Uncomment the following line to clean up and reinitialize the database
+    # vectorstore = cleanup_and_init_db()
+    
+    # Or use normal initialization
     vectorstore = init_vectorstore()
     logger.info("Vector store initialization complete!")
 except Exception as e:
@@ -425,7 +641,7 @@ User Query: {user_input}
 
         print("Sending request to Together AI")
         response = client.chat.completions.create(
-            model=os.getenv('MODEL_NAME', 'togethercomputer/llama-2-70b-chat'),
+            model=os.getenv('MODEL_NAME'),
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant that helps users find relevant projects based on their queries. You have access to project data and can provide detailed information about projects that match the user's interests."},
                 {"role": "user", "content": prompt}
@@ -449,50 +665,97 @@ User Query: {user_input}
         print(f"Error processing request: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/test-db', methods=['GET'])
+@app.route('/test-db')
 def test_db():
-    """Test database connection and collection status"""
     try:
-        database_url = os.getenv('DATABASE_URL')
-        
-        # Get all collections (tables) in the database
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # Get collection details
         cur.execute("""
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public'
-            AND table_type = 'BASE TABLE';
+            SELECT 
+                name,
+                uuid,
+                cmetadata
+            FROM langchain_pg_collection
+            ORDER BY name;
         """)
-        collections = [row[0] for row in cur.fetchall()]
+        collections = cur.fetchall()
+        
+        # Get embedding counts for each collection
+        collection_data = []
+        for collection in collections:
+            name, uuid, metadata = collection
+            
+            # Get embedding count
+            cur.execute(f"""
+                SELECT COUNT(*) 
+                FROM langchain_pg_embedding 
+                WHERE collection_id = %s;
+            """, (uuid,))
+            embedding_count = cur.fetchone()[0]
+            
+            # Get file hash
+            cur.execute("""
+                SELECT file_hash 
+                FROM file_hashes 
+                WHERE collection_name = %s;
+            """, (name,))
+            hash_result = cur.fetchone()
+            file_hash = hash_result[0] if hash_result else None
+            
+            collection_data.append({
+                "name": name,
+                "uuid": str(uuid),
+                "metadata": metadata,
+                "embedding_count": embedding_count,
+                "file_hash": file_hash
+            })
+        
+        # Get sample documents from the current collection
+        collection_name = get_collection_name()
+        cur.execute("""
+            SELECT 
+                document,
+                cmetadata
+            FROM langchain_pg_embedding
+            WHERE collection_id = (
+                SELECT uuid 
+                FROM langchain_pg_collection 
+                WHERE name = %s
+            )
+            LIMIT 5;
+        """, (collection_name,))
+        sample_documents = cur.fetchall()
+        
+        # Format sample documents with both content and metadata
+        formatted_documents = []
+        for doc, metadata in sample_documents:
+            formatted_documents.append({
+                "document": {
+                    "content": doc,
+                    "metadata": metadata
+                }
+            })
+        
         cur.close()
         conn.close()
-        
-        # Get collection sizes
-        collection_sizes = {}
-        for collection in collections:
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute(f"SELECT COUNT(*) FROM {collection}")
-                collection_sizes[collection] = cur.fetchone()[0]
-                cur.close()
-                conn.close()
-            except Exception as e:
-                logger.error(f"Error getting size for collection {collection}: {str(e)}")
-                collection_sizes[collection] = "error"
         
         return jsonify({
             "status": "success",
             "database_connection": "ok",
-            "available_collections": collections,
-            "collection_sizes": collection_sizes
+            "collections": collection_data,
+            "current_collection": {
+                "name": collection_name,
+                "sample_documents": formatted_documents
+            }
         })
         
     except Exception as e:
         logger.error(f"Database test failed: {str(e)}")
         return jsonify({
             "status": "error",
+            "database_connection": "failed",
             "error": str(e)
         }), 500
 
