@@ -32,43 +32,8 @@ client.api_key = os.getenv('TOGETHER_API_KEY')
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 def get_db_connection():
-    """Get a database connection with proper pooling for Neon database"""
-    try:
-        database_url = os.getenv('DATABASE_URL')
-        if not database_url:
-            logger.error("DATABASE_URL environment variable is not set")
-            raise ValueError("DATABASE_URL environment variable is not set")
-            
-        # Ensure the URL has the correct SSL mode for Neon
-        if 'sslmode=require' not in database_url:
-            database_url = f"{database_url}?sslmode=require"
-            
-        logger.info(f"Attempting to connect to database with URL: {database_url[:30]}...")
-        
-        # Add connection pooling parameters
-        conn = psycopg2.connect(
-            database_url,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5
-        )
-        
-        # Set session parameters for better performance
-        with conn.cursor() as cur:
-            cur.execute("SET statement_timeout = '30s'")
-            cur.execute("SET idle_in_transaction_session_timeout = '30s'")
-        
-        logger.info("Successfully connected to database")
-        return conn
-    except psycopg2.Error as e:
-        logger.error(f"Database connection error: {str(e)}")
-        logger.error(f"Error code: {e.pgcode}")
-        logger.error(f"Error details: {e.pgerror}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error during database connection: {str(e)}")
-        raise
+    """Get a database connection"""
+    return psycopg2.connect(os.getenv('DATABASE_URL'))
 
 def get_file_hash(file_path):
     """Calculate MD5 hash of a file"""
@@ -451,35 +416,6 @@ def init_vectorstore():
     
     collection_name = get_collection_name()
     database_url = os.getenv('DATABASE_URL')
-    
-    if not database_url:
-        logger.error("DATABASE_URL environment variable is not set")
-        raise ValueError("DATABASE_URL environment variable is not set")
-    
-    # Ensure the URL has the correct SSL mode for Neon
-    if 'sslmode=require' not in database_url:
-        database_url = f"{database_url}?sslmode=require"
-        
-    logger.info(f"Initializing vector store with collection name: {collection_name}")
-    logger.info(f"Database URL: {database_url[:30]}...")
-    
-    # Test database connection with retries
-    max_retries = 3
-    retry_delay = 5  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            conn = get_db_connection()
-            conn.close()
-            logger.info("Database connection test successful")
-            break
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.error(f"Failed to connect to database after {max_retries} attempts")
-                raise
-            logger.warning(f"Database connection attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
-            time.sleep(retry_delay)
-    
     excel_path = os.path.join(data_dir, "Data Sample for Altro AI-1.xlsx")
     
     # Check if Excel file exists
@@ -519,29 +455,22 @@ def init_vectorstore():
         logger.info("Loading documents for update...")
         documents, _ = load_documents()
         
-        # Create or update vector store with connection pooling
-        logger.info("Creating vector store...")
+        # Create or update vector store
         vectorstore = PGVector.from_documents(
             documents=documents,
             embedding=get_embeddings(),
             collection_name=collection_name,
             connection_string=database_url,
             pre_delete_collection=True,
-            collection_metadata={"name": collection_name},
-            connection_kwargs={
-                "keepalives": 1,
-                "keepalives_idle": 30,
-                "keepalives_interval": 10,
-                "keepalives_count": 5
-            }
+            collection_metadata={"name": collection_name}  # Add collection metadata
         )
         
         # Verify metadata storage
         try:
             test_doc = vectorstore.similarity_search("test", k=1)[0]
-            logger.info(f"Test document metadata after storage: {test_doc.metadata}")
+            print(f"Test document metadata after storage: {test_doc.metadata}")
         except Exception as e:
-            logger.error(f"Error verifying metadata: {str(e)}")
+            print(f"Error verifying metadata: {str(e)}")
         
         # Update hash only after successful update
         update_stored_hash(database_url, collection_name, current_hash)
@@ -555,8 +484,6 @@ def init_vectorstore():
         
     except Exception as e:
         logger.error(f"Error during vector store initialization: {str(e)}")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error details: {str(e)}")
         if exists:
             logger.info("Attempting to restore from latest backup...")
             latest_backup = get_latest_backup(database_url, collection_name)
@@ -695,39 +622,25 @@ def ask():
         return "", 204
 
     try:
-        print("\n=== Starting New Request ===")
-        print("Request Headers:", dict(request.headers))
-        print("Request Body:", request.get_json())
-        
+        print("Received request:", request.get_json())
         data = request.get_json()
         if not data or "query" not in data:
-            print("Error: No query in request data")
             return jsonify({"error": "Query is required"}), 400
 
         user_input = data["query"]
         if not user_input:
-            print("Error: Empty query")
             return jsonify({"error": "Query cannot be empty"}), 400
 
-        print("\n=== Processing Query ===")
-        print("User Input:", user_input)
+        print("Processing query:", user_input)
         
         # Get relevant projects from vector store
         project_info = ""
         if vectorstore:
             try:
-                print("\n=== Vector Store Search ===")
                 relevant_projects = vectorstore.similarity_search(user_input, k=3)
-                print(f"Found {len(relevant_projects)} relevant projects")
-                
                 # Format project information with detailed metadata
                 project_info = "\n\nRelevant Projects:\n"
                 for i, project in enumerate(relevant_projects, 1):
-                    print(f"\nProject {i}:")
-                    print(f"Title: {project.metadata.get('title', 'Untitled Project')}")
-                    print(f"Description: {project.page_content[:100]}...")  # First 100 chars
-                    print(f"Metadata: {project.metadata}")
-                    
                     project_info += f"\n{i}. {project.metadata.get('title', 'Untitled Project')}\n"
                     project_info += f"   Description: {project.page_content}\n"
                     if project.metadata.get('contact_email'):
@@ -736,6 +649,8 @@ def ask():
             except Exception as e:
                 print(f"Error accessing vector store: {str(e)}")
                 print("Full error details:", e.__dict__)
+        else:
+            print("Warning: Vector store is not initialized!")
         
         # Create enhanced prompt with project information
         prompt = f"""
