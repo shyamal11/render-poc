@@ -6,6 +6,7 @@ langchain==0.1.12
 langchain-community>=0.0.28
 langchain-core==0.1.32
 psycopg2-binary==2.9.9
+pgvector==0.4.0
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
 transformers==4.38.2
