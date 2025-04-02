@@ -621,7 +621,7 @@ def ask():
  
  ### AVAILABLE PROJECTS DATABASE
  Below is the database of specific Art of Living projects that you MUST reference when making recommendations:
- 
+ remember dont hallucinate, dont make up projects, dont make up details
  {project_info}
  
  ### IMPORTANT INSTRUCTIONS
