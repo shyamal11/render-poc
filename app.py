@@ -123,6 +123,7 @@ def load_documents():
                 "donation_needs": safe("Donation Needs"),
                 "donation_amount": safe("Donation Amount ($)"),
                 "donation_need_by": safe("Donation Need by"),
+                "donation_link": safe("Donation Links"),
             }
 
             desc = row.get("Generated Description", "")
