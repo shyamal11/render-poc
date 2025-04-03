@@ -597,17 +597,26 @@ def ask():
         
         # Get relevant projects from vector store
         project_info = ""
+        project_info_dict = []
         if vectorstore:
             try:
                 relevant_projects = vectorstore.similarity_search(user_input, k=3)
                 # Format project information with detailed metadata
                 project_info = "\n\nRelevant Projects:\n"
                 for i, project in enumerate(relevant_projects, 1):
+                    project_info_dict.append({
+                        "title": project.metadata.get('title', 'Untitled Project'),
+                        "description": project.page_content,
+                        "contact_email": project.metadata.get('contact_email'),
+                        "link": project.metadata.get('link', ''),
+                        "donation_link": project.metadata.get('donation_link', 'N/A')
+                    })
                     project_info += f"\n{i}. {project.metadata.get('title', 'Untitled Project')}\n"
                     project_info += f"   Description: {project.page_content}\n"
                     if project.metadata.get('contact_email'):
                         project_info += f"   Contact: {project.metadata['contact_email']}\n"
                     project_info += f"   Link: {project.metadata.get('link', 'N/A')}\n"
+                    project_info += f"   Donation Link: {project.metadata.get('donation_link', 'N/A')}\n"
             except Exception as e:
                 print(f"Error accessing vector store: {str(e)}")
                 print("Full error details:", e.__dict__)
@@ -651,7 +660,7 @@ def ask():
                 {"role": "system", "content": "You are a helpful AI assistant that helps users find relevant projects based on their queries. You have access to project data and can provide detailed information about projects that match the user's interests."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1024,
+            max_tokens=4096,
             temperature=0.7,
             top_p=0.7,
             top_k=50,
@@ -664,6 +673,7 @@ def ask():
         
         return jsonify({
             "response": full_response,
+            "projects": project_info_dict,
             "environment": "production" if os.getenv('FLASK_ENV') == 'production' else "development"
         })
 
